@@ -1,0 +1,149 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BT-Typer Sender</title>
+<style>
+  body{font-family:system-ui;margin:16px;max-width:760px}
+  textarea{width:100%;height:160px}
+  button{margin:6px 6px 6px 0;padding:10px 16px}
+  #log{white-space:pre-wrap;background:#111;color:#0f0;padding:8px;border-radius:6px;min-height:100px}
+</style>
+
+<h1>BT-Typer Sender</h1>
+<p>1) Tap <b>Init</b> • 2) Route audio to your ESP32 • 3) Paste → <b>Send</b></p>
+<div>
+  <button id="init">Init</button>
+  <button id="beep">Beep (1 kHz, 1.5 s)</button>
+</div>
+<textarea id="t" placeholder="Paste text here"></textarea><br>
+<label><input id="enter" type="checkbox" checked> Append Enter</label>
+<button id="send">Send</button>
+
+<h3>Log</h3>
+<div id="log"></div>
+
+<script>
+let ctx, sr;
+const log = (...a)=>{ const el=document.getElementById('log'); el.textContent += a.join(' ')+'\n'; el.scrollTop = el.scrollHeight; };
+
+function ensureCtx(){
+  if (ctx) return ctx;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC){ log('ERROR: WebAudio not supported'); return null; }
+  ctx = new AC({sampleRate:44100}); sr = ctx.sampleRate;
+  log('AudioContext state=', ctx.state, ' sampleRate=', sr);
+  return ctx;
+}
+async function unlock(){
+  const c = ensureCtx(); if(!c) return;
+  try { await c.resume(); } catch(e){}
+  const b = c.createBuffer(1, 256, c.sampleRate);
+  const s = c.createBufferSource(); s.buffer=b; s.connect(c.destination); s.start();
+  log('Audio unlocked; state=', c.state);
+}
+async function playOsc(freq, ms, gain=0.6){
+  const c = ensureCtx(); if(!c) return;
+  try { await c.resume(); } catch(e){}
+  const o = c.createOscillator(), g = c.createGain();
+  g.gain.value = gain; o.frequency.value = freq;
+  o.connect(g).connect(c.destination); o.start();
+  log('Beep', freq, 'Hz for', ms,'ms');
+  setTimeout(()=>{ o.stop(); }, ms);
+}
+function makeBuffer(samples){
+  const c = ensureCtx(); if(!c) return null;
+  const buf = c.createBuffer(1, samples.length, c.sampleRate);
+  buf.getChannelData(0).set(samples); return buf;
+}
+async function playSamples(samples){
+  const c = ensureCtx(); if(!c) return;
+  try { await c.resume(); } catch(e){}
+  const src = c.createBufferSource();
+  src.buffer = makeBuffer(samples);
+  src.connect(c.destination);
+  return new Promise((res,rej)=>{
+    src.onended = res;
+    try { src.start(); } catch(e){ rej(e); }
+  });
+}
+
+// -------- Modem (600 baud, MARK 1200, SPACE 2000) --------
+const MARK=1200, SPACE=2000, BAUD=600;
+const PRE_MS=500;                 // preamble length
+const GAP_SAMPLES=Math.round(0.04*44100); // 40 ms gap before data
+function tone(samples, freq, ms, ofs){
+  const N = Math.round(ms/1000 * sr);
+  for(let i=0;i<N;i++){ samples[ofs+i] = Math.sin(2*Math.PI*freq*(i/sr))*0.5; }
+  return ofs+N;
+}
+function bytesToBits(bytes){
+  const bits=[];
+  for (let b of bytes){
+    bits.push(0);               // start
+    for (let i=0;i<8;i++) bits.push((b>>i)&1);
+    bits.push(1);               // stop
+  }
+  return bits;
+}
+function bitstream(samples, bits, ofs){
+  const spb = Math.round(sr/BAUD);
+  for (let b of bits){
+    const f = b ? SPACE : MARK;
+    for (let i=0;i<spb;i++){
+      samples[ofs++] = Math.sin(2*Math.PI*f*(i/sr))*0.5;
+    }
+  }
+  return ofs;
+}
+function crc16(bytes){
+  let crc=0xFFFF;
+  for (let b of bytes){ crc^=b; for (let i=0;i<8;i++){ const m=crc&1; crc>>=1; if(m) crc^=0xA001; } }
+  return crc & 0xFFFF;
+}
+function buildFrame(payload){
+  const len = payload.length, out = new Uint8Array(1+1+2+len+2+1);
+  let o=0;
+  out[o++]=0x55;        // marker (unused by decoder, kept for future)
+  out[o++]=0x02;        // STX
+  out[o++]=len & 0xFF; out[o++]=(len>>8)&0xFF;
+  out.set(payload, o); o+=len;
+  const c = crc16(payload);
+  out[o++]=c & 0xFF; out[o++]=(c>>8)&0xFF;
+  out[o++]=0x03;        // ETX
+  return out;
+}
+async function sendText(txt){
+  const enc = new TextEncoder();
+  const payload = enc.encode(txt);
+  const frame = buildFrame(payload);
+  const bits  = bytesToBits(frame);
+  const spb   = Math.round(sr/BAUD);
+  const total = Math.round(PRE_MS/1000*sr) + GAP_SAMPLES + bits.length*spb + Math.round(0.06*sr); // +60ms tail silence
+  const samples = new Float32Array(total);
+  let idx=0;
+  idx = tone(samples, MARK, PRE_MS, idx);
+  idx += GAP_SAMPLES;
+  idx = bitstream(samples, bits, idx);
+  idx += Math.round(0.06*sr); // tail silence
+  await playSamples(samples);
+}
+
+document.getElementById('init').onclick = unlock;
+document.getElementById('beep').onclick = ()=>playOsc(1000,1500);
+document.getElementById('send').onclick = async ()=>{
+  const enter = document.getElementById('enter').checked ? "\n" : "";
+  const txt = document.getElementById('t').value + enter;
+  if (!txt) { log('Nothing to send'); return; }
+  // chunk very long texts
+  const CHUNK = 1500;
+  for (let i=0;i<txt.length;i+=CHUNK){
+    await sendText(txt.slice(i,i+CHUNK));
+    await new Promise(r=>setTimeout(r,200));  // longer inter-burst gap
+  }
+  log('Sent.');
+};
+
+// also try to unlock on first user gesture
+['click','touchstart','pointerdown'].forEach(ev=>{
+  window.addEventListener(ev, ()=>{ if(!ctx) unlock(); }, {once:true,passive:true});
+});
+</script>
