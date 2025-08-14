@@ -1,35 +1,102 @@
 <!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Remote Paste → BT</title>
+<title>BT-Typer Debug + Sender</title>
 <style>
-body{font-family:system-ui;margin:16px;max-width:720px}
-textarea{width:100%;height:160px}
-button{margin:6px 6px 6px 0;padding:10px 16px}
+  body{font-family:system-ui;margin:16px;max-width:760px}
+  textarea{width:100%;height:160px}
+  button{margin:6px 6px 6px 0;padding:10px 16px}
+  #log{white-space:pre-wrap;background:#111;color:#0f0;padding:8px;border-radius:6px;min-height:120px}
 </style>
-<h1>Send to BT-Typer</h1>
+
+<h1>BT-Typer Debug + Sender</h1>
+<ol>
+  <li>Tap <b>Init / Unlock Audio</b>.</li>
+  <li>(iPhone) In Control Center, route audio to <b>BT-Typer</b>.</li>
+  <li>Tap <b>Beep</b>. You won't hear it if routed to ESP32, but ESP32 should show PCM callbacks.</li>
+  <li>Use <b>FSK Test Tone</b> to verify longer playback, then <b>Send</b> for modem frames.</li>
+</ol>
+
+<div>
+  <button id="init">Init / Unlock Audio</button>
+  <button id="beep">Beep (1 kHz, 1.5s)</button>
+  <button id="fsk">FSK Test Tone (MARK 1200Hz, 2s)</button>
+</div>
+
 <textarea id="t" placeholder="Paste text here"></textarea><br>
-<label><input id="enter" type="checkbox" checked> Send ENTER at end</label>
-<button id="test">Test Tone</button>
-<button id="send">Send</button>
-<div id="status"></div>
+<label><input id="enter" type="checkbox" checked> Append Enter</label>
+<button id="send">Send (modem)</button>
+
+<h3>Log</h3>
+<div id="log"></div>
 
 <script>
-const SR=44100, MARK=1200, SPACE=2000, BAUD=600;
-let actx;
+let ctx, sr;
+const log = (...a)=>{ const el=document.getElementById('log'); el.textContent += a.join(' ')+'\n'; el.scrollTop = el.scrollHeight; };
 
-function crc16(bytes){
-  let crc=0xFFFF;
-  for(let b of bytes){ crc^=b; for(let i=0;i<8;i++){ const m=crc&1; crc>>=1; if(m) crc^=0xA001; } }
-  return crc&0xFFFF;
+function ensureCtx(){
+  if (ctx) return ctx;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC){ log('ERROR: WebAudio not supported'); return null; }
+  ctx = new AC({sampleRate:44100});
+  sr = ctx.sampleRate;
+  log('AudioContext state=', ctx.state, ' sampleRate=', sr);
+  return ctx;
 }
 
-function tone(buf, freq, ms, idx){
-  const N = Math.round(ms/1000*SR);
+async function unlock(){
+  const c = ensureCtx(); if(!c) return;
+  try { await c.resume(); log('resume():', c.state); }
+  catch(e){ log('resume() error:', e); }
+  // iOS sometimes needs a short silent buffer to truly unlock
+  const b = c.createBuffer(1, 128, c.sampleRate);
+  const s = c.createBufferSource(); s.buffer=b; s.connect(c.destination); s.start();
+  log('Primed with silent buffer.');
+}
+
+async function playOsc(freq, ms, gain=0.5){
+  const c = ensureCtx(); if(!c) return;
+  try { await c.resume(); } catch(e){}
+  const o = c.createOscillator();
+  const g = c.createGain();
+  g.gain.value = gain;
+  o.frequency.setValueAtTime(freq, c.currentTime);
+  o.connect(g).connect(c.destination);
+  o.start();
+  log('Osc start', freq,'Hz for',ms,'ms');
+  setTimeout(()=>{ o.stop(); log('Osc stop'); }, ms);
+}
+
+function makeBuffer(samples){
+  const c = ensureCtx(); if(!c) return null;
+  const buf = c.createBuffer(1, samples.length, c.sampleRate);
+  buf.getChannelData(0).set(samples);
+  return buf;
+}
+
+async function playSamples(samples){
+  const c = ensureCtx(); if(!c) return;
+  try { await c.resume(); } catch(e){ log('resume err', e); }
+  const buf = makeBuffer(samples);
+  const src = c.createBufferSource();
+  src.buffer = buf;
+  src.connect(c.destination);
+  return new Promise((res,rej)=>{
+    src.onended = ()=>{ log('buffer ended'); res(); };
+    try { src.start(); log('buffer start len=', samples.length); }
+    catch(e){ log('start err', e); rej(e); }
+  });
+}
+
+// ---------- Modem helpers ----------
+const MARK = 1200, SPACE = 2000, BAUD = 600;
+
+function tone(samples, freq, ms, ofs){
+  const N = Math.round(ms/1000 * sr);
   for(let i=0;i<N;i++){
-    const t = 2*Math.PI*freq*(i/SR);
-    buf[idx+i] = Math.sin(t)*0.5;
+    const t = 2*Math.PI*freq*(i/sr);
+    samples[ofs+i] = Math.sin(t)*0.5;
   }
-  return idx+N;
+  return ofs+N;
 }
 
 function bytesToBits(bytes){
@@ -42,40 +109,42 @@ function bytesToBits(bytes){
   return bits;
 }
 
-function bitstream(samples,bits,idx){
-  const spb = Math.round(SR/BAUD);
+function bitstream(samples, bits, ofs){
+  const spb = Math.round(sr/BAUD);
   for(let b of bits){
     const f = b ? SPACE : MARK;
     for(let i=0;i<spb;i++){
-      const t = 2*Math.PI*f*(i/SR);
-      samples[idx++] = Math.sin(t)*0.5;
+      const t = 2*Math.PI*f*(i/sr);
+      samples[ofs++] = Math.sin(t)*0.5;
     }
   }
-  return idx;
+  return ofs;
 }
 
-async function play(samples){
-  if(!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
-  const buf = actx.createBuffer(1, samples.length, SR);
-  buf.getChannelData(0).set(samples);
-  const src = actx.createBufferSource();
-  src.buffer = buf;
-  src.connect(actx.destination);
-  src.start();
-  await new Promise(r=>src.onended=r);
+function crc16(bytes){
+  let crc=0xFFFF;
+  for (let b of bytes){
+    crc ^= b;
+    for (let i=0;i<8;i++){
+      const m = crc & 1;
+      crc >>= 1;
+      if (m) crc ^= 0xA001;
+    }
+  }
+  return crc & 0xFFFF;
 }
 
 function buildFrame(payload){
   const len = payload.length;
   const frame = new Uint8Array(1+1+2+len+2+1);
   let o=0;
-  frame[o++]=0x55; // dummy marker (not used by sketch, kept for future)
-  frame[o++]=0x02; // STX
+  frame[o++]=0x55;         // marker (not used by current demod)
+  frame[o++]=0x02;         // STX
   frame[o++]=len & 0xFF; frame[o++]=(len>>8)&0xFF;
   frame.set(payload,o); o+=len;
-  const crc = crc16(payload);
-  frame[o++]=crc & 0xFF; frame[o++]=(crc>>8)&0xFF;
-  frame[o++]=0x03; // ETX
+  const c = crc16(payload);
+  frame[o++]=c & 0xFF; frame[o++]=(c>>8)&0xFF;
+  frame[o++]=0x03;         // ETX
   return frame;
 }
 
@@ -83,34 +152,48 @@ async function sendText(txt){
   const enc = new TextEncoder();
   const payload = enc.encode(txt);
   const frame = buildFrame(payload);
-  // preamble MARK 200ms + 20ms gap + 8N1 bits
   const bits = bytesToBits(frame);
-  const samples = new Float32Array(Math.round(0.22*SR) + bits.length*Math.round(SR/BAUD));
+  const total = Math.round(0.22*sr) + bits.length*Math.round(sr/BAUD);
+  const samples = new Float32Array(total);
   let idx=0;
   idx = tone(samples, MARK, 200, idx);
-  idx += Math.round(0.02*SR);
+  idx += Math.round(0.02*sr);
   idx = bitstream(samples, bits, idx);
-  await play(samples);
+  log('sendText len=', payload.length, 'samples=', samples.length);
+  await playSamples(samples);
 }
 
-document.getElementById('test').onclick = () => {
-  document.getElementById('status').textContent = 'Test tone…';
-  const s = new Float32Array(Math.round(0.5*SR));
-  tone(s, 1000, 500, 0);
-  play(s).then(()=>document.getElementById('status').textContent='Done');
+document.getElementById('init').onclick = unlock;
+document.getElementById('beep').onclick = ()=>playOsc(1000, 1500, 0.6);
+document.getElementById('fsk').onclick = ()=>{
+  const c = ensureCtx(); if(!c) return;
+  const secs = 2.0;
+  const N = Math.round(sr*secs);
+  const samples = new Float32Array(N);
+  for (let i=0;i<N;i++){
+    const t = i/sr;
+    samples[i] = Math.sin(2*Math.PI*MARK*t)*0.5; // MARK only
+  }
+  playSamples(samples);
 };
-
-document.getElementById('send').onclick = async () => {
+document.getElementById('send').onclick = async ()=>{
   const enter = document.getElementById('enter').checked ? "\n" : "";
   const txt = document.getElementById('t').value + enter;
-  if(!txt.length){ return; }
-  document.getElementById('status').textContent = 'Sending…';
-  // Chunk very long texts
-  const CHUNK = 1500;
+  if(!txt){ log('Nothing to send'); return; }
+  // chunk long texts
+  const CHUNK=1500;
   for(let i=0;i<txt.length;i+=CHUNK){
-    await sendText(txt.slice(i,i+CHUNK));
+    const part = txt.slice(i,i+CHUNK);
+    await sendText(part);
     await new Promise(r=>setTimeout(r,120));
   }
-  document.getElementById('status').textContent = 'Sent.';
+  log('All chunks sent.');
 };
+
+// Also try to unlock on first touch anywhere
+['click','touchstart','touchend'].forEach(ev=>{
+  window.addEventListener(ev, async ()=>{
+    if (!ctx){ await unlock(); }
+  }, {once:true, passive:true});
+});
 </script>
