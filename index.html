@@ -1,0 +1,116 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Remote Paste → BT</title>
+<style>
+body{font-family:system-ui;margin:16px;max-width:720px}
+textarea{width:100%;height:160px}
+button{margin:6px 6px 6px 0;padding:10px 16px}
+</style>
+<h1>Send to BT-Typer</h1>
+<textarea id="t" placeholder="Paste text here"></textarea><br>
+<label><input id="enter" type="checkbox" checked> Send ENTER at end</label>
+<button id="test">Test Tone</button>
+<button id="send">Send</button>
+<div id="status"></div>
+
+<script>
+const SR=44100, MARK=1200, SPACE=2000, BAUD=600;
+let actx;
+
+function crc16(bytes){
+  let crc=0xFFFF;
+  for(let b of bytes){ crc^=b; for(let i=0;i<8;i++){ const m=crc&1; crc>>=1; if(m) crc^=0xA001; } }
+  return crc&0xFFFF;
+}
+
+function tone(buf, freq, ms, idx){
+  const N = Math.round(ms/1000*SR);
+  for(let i=0;i<N;i++){
+    const t = 2*Math.PI*freq*(i/SR);
+    buf[idx+i] = Math.sin(t)*0.5;
+  }
+  return idx+N;
+}
+
+function bytesToBits(bytes){
+  const bits=[];
+  for(let b of bytes){
+    bits.push(0); // start
+    for(let i=0;i<8;i++) bits.push((b>>i)&1);
+    bits.push(1); // stop
+  }
+  return bits;
+}
+
+function bitstream(samples,bits,idx){
+  const spb = Math.round(SR/BAUD);
+  for(let b of bits){
+    const f = b ? SPACE : MARK;
+    for(let i=0;i<spb;i++){
+      const t = 2*Math.PI*f*(i/SR);
+      samples[idx++] = Math.sin(t)*0.5;
+    }
+  }
+  return idx;
+}
+
+async function play(samples){
+  if(!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
+  const buf = actx.createBuffer(1, samples.length, SR);
+  buf.getChannelData(0).set(samples);
+  const src = actx.createBufferSource();
+  src.buffer = buf;
+  src.connect(actx.destination);
+  src.start();
+  await new Promise(r=>src.onended=r);
+}
+
+function buildFrame(payload){
+  const len = payload.length;
+  const frame = new Uint8Array(1+1+2+len+2+1);
+  let o=0;
+  frame[o++]=0x55; // dummy marker (not used by sketch, kept for future)
+  frame[o++]=0x02; // STX
+  frame[o++]=len & 0xFF; frame[o++]=(len>>8)&0xFF;
+  frame.set(payload,o); o+=len;
+  const crc = crc16(payload);
+  frame[o++]=crc & 0xFF; frame[o++]=(crc>>8)&0xFF;
+  frame[o++]=0x03; // ETX
+  return frame;
+}
+
+async function sendText(txt){
+  const enc = new TextEncoder();
+  const payload = enc.encode(txt);
+  const frame = buildFrame(payload);
+  // preamble MARK 200ms + 20ms gap + 8N1 bits
+  const bits = bytesToBits(frame);
+  const samples = new Float32Array(Math.round(0.22*SR) + bits.length*Math.round(SR/BAUD));
+  let idx=0;
+  idx = tone(samples, MARK, 200, idx);
+  idx += Math.round(0.02*SR);
+  idx = bitstream(samples, bits, idx);
+  await play(samples);
+}
+
+document.getElementById('test').onclick = () => {
+  document.getElementById('status').textContent = 'Test tone…';
+  const s = new Float32Array(Math.round(0.5*SR));
+  tone(s, 1000, 500, 0);
+  play(s).then(()=>document.getElementById('status').textContent='Done');
+};
+
+document.getElementById('send').onclick = async () => {
+  const enter = document.getElementById('enter').checked ? "\n" : "";
+  const txt = document.getElementById('t').value + enter;
+  if(!txt.length){ return; }
+  document.getElementById('status').textContent = 'Sending…';
+  // Chunk very long texts
+  const CHUNK = 1500;
+  for(let i=0;i<txt.length;i+=CHUNK){
+    await sendText(txt.slice(i,i+CHUNK));
+    await new Promise(r=>setTimeout(r,120));
+  }
+  document.getElementById('status').textContent = 'Sent.';
+};
+</script>
