@@ -8,26 +8,45 @@
 </style>
 <h1>Send to BT-Typer</h1>
 <textarea id="t" placeholder="Paste text here"></textarea><br>
-<label><input id="enter" type="checkbox" checked> Send ENTER at end</label>
+<label><input id="enter" type="checkbox" checked> Send ENTER at end</label><br>
+<button id="unlock">Unlock Audio</button>
 <button id="test">Test Tone</button>
 <button id="send">Send</button>
 <div id="status"></div>
 
 <script>
-const BAUD=600, MARK=1200, SPACE=2000; // 0 and 1
+const BAUD=600, MARK=1200, SPACE=2000;
 let actx;
+let _liveNodes = new Set();
 
-// CRC16-IBM
+// --- AudioContext unlock helpers ---
+async function getCtx() {
+  if (!actx) {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (actx.state !== 'running') {
+    try { await actx.resume(); } catch(e) { console.log('resume failed', e); }
+  }
+  return actx;
+}
+function keepAlive(node) {
+  _liveNodes.add(node);
+  const done = () => { _liveNodes.delete(node); };
+  if ('onended' in node) node.onended = done;
+  return node;
+}
+
+// --- CRC16-IBM ---
 function crc16(bytes){
   let crc=0xFFFF;
   for(let b of bytes){ crc^=b; for(let i=0;i<8;i++){ const m=crc&1; crc>>=1; if(m) crc^=0xA001; } }
   return crc&0xFFFF;
 }
 
-// Build framed payload: STX len lo/hi data CRC lo/hi ETX
+// --- Frame builder ---
 function buildFrame(payload){
   const len = payload.length;
-  const frame = new Uint8Array(2+2+len+2+1);
+  const frame = new Uint8Array(2+len+2+1);
   let o=0;
   frame[o++]=0x02; // STX
   frame[o++]=len & 0xFF; frame[o++]=(len>>8)&0xFF;
@@ -38,25 +57,23 @@ function buildFrame(payload){
   return frame;
 }
 
-// Convert bytes -> async serial bits (8N2)
+// --- Bytes → bits (8N2) ---
 function bytesToBits(bytes){
   const bits=[];
   for(let b of bytes){
     bits.push(0); // start
     for(let i=0;i<8;i++) bits.push((b>>i)&1);
     bits.push(1); // stop 1
-    bits.push(1); // stop 2 (gives RX more breathing room)
+    bits.push(1); // stop 2
   }
   return bits;
 }
 
-// Generate BFSK with continuous phase and Bresenham bit lengths, stereo
+// --- BFSK synth continuous phase ---
 function synth(bits, pre_ms, sampleRate){
   const spb = sampleRate / BAUD;
   const spb_int = Math.floor(spb);
   const spb_frac = spb - spb_int;
-
-  // Count total samples
   let fracAcc = 0.0, total = 0;
   for(let _ of bits){ let n = spb_int; fracAcc+=spb_frac; if(fracAcc>=1){ n++; fracAcc-=1; } total += n; }
   const pre_samps = Math.round(pre_ms/1000*sampleRate);
@@ -66,15 +83,13 @@ function synth(bits, pre_ms, sampleRate){
   const chR = new Float32Array(total);
 
   let idx=0;
-  // SPACE preamble (idle='1') to let RX lock AGC/clock
-  let phase = 0.0, twoPi = 2*Math.PI;
+  let phase=0.0, twoPi=2*Math.PI;
   let w = twoPi * SPACE / sampleRate;
   for(let i=0;i<pre_samps;i++){
     const s = Math.sin(phase)*0.6;
-    chL[idx] = s; chR[idx] = s; idx++; phase += w; if(phase>twoPi) phase-=twoPi;
+    chL[idx]=s; chR[idx]=s; idx++; phase+=w; if(phase>twoPi) phase-=twoPi;
   }
 
-  // Bits
   fracAcc = 0.0;
   for(let b of bits){
     const freq = b ? SPACE : MARK;
@@ -82,67 +97,70 @@ function synth(bits, pre_ms, sampleRate){
     let n = spb_int; fracAcc+=spb_frac; if(fracAcc>=1){ n++; fracAcc-=1; }
     for(let i=0;i<n;i++){
       const s = Math.sin(phase)*0.6;
-      chL[idx] = s; chR[idx] = s; idx++; phase += w; if(phase>twoPi) phase-=twoPi;
+      chL[idx]=s; chR[idx]=s; idx++; phase+=w; if(phase>twoPi) phase-=twoPi;
     }
   }
-
-  return [chL, chR];
+  return [chL,chR];
 }
 
-async function playStereo(chL, chR, sampleRate){
-  if(!actx) actx = new (window.AudioContext||window.webkitAudioContext)({sampleRate: undefined});
-  // Use ACTUAL context rate to avoid extra resampling
-  const sr = actx.sampleRate || sampleRate;
-  const buf = actx.createBuffer(2, chL.length, sr);
+// --- Play helpers ---
+async function playStereo(chL,chR){
+  const ac = await getCtx();
+  const sr = ac.sampleRate;
+  const buf = ac.createBuffer(2,chL.length,sr);
   buf.getChannelData(0).set(chL);
   buf.getChannelData(1).set(chR);
-  const src = actx.createBufferSource();
-  src.buffer = buf; src.connect(actx.destination);
+  const src = ac.createBufferSource();
+  src.buffer = buf;
+  src.connect(ac.destination);
+  keepAlive(src);
   src.start();
-  await new Promise(r=>src.onended=r);
+  await new Promise(r => src.onended = r);
 }
 
+// --- High-level send ---
 async function sendText(txt){
-  if(!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
-  const sr = actx.sampleRate;
-
-  // UTF-8 payload
+  const ac = await getCtx();
+  const sr = ac.sampleRate;
   const enc = new TextEncoder();
   const payload = enc.encode(txt);
   const frame = buildFrame(payload);
-
-  // Serialize -> BFSK with SPACE preamble and 2 stop bits
   const bits = bytesToBits(frame);
-  const [chL, chR] = synth(bits, /*preamble ms*/ 250, sr);
-  await playStereo(chL, chR, sr);
+  const [chL,chR] = synth(bits,250,sr);
+  await playStereo(chL,chR);
 }
 
+// --- UI handlers ---
+document.getElementById('unlock').onclick = async () => {
+  const ac = await getCtx();
+  document.getElementById('status').textContent =
+    `AudioContext: ${ac.state} • ${ac.sampleRate} Hz`;
+};
+
 document.getElementById('test').onclick = async () => {
-  document.getElementById('status').textContent = 'Test tone…';
-  if(!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
-  const sr = actx.sampleRate;
-  const secs = 0.6;
-  const N = Math.floor(secs*sr);
-  const chL = new Float32Array(N), chR = new Float32Array(N);
-  let phase=0, w=2*Math.PI*1000/sr;
-  for(let i=0;i<N;i++){ const s=Math.sin(phase)*0.6; chL[i]=s; chR[i]=s; phase+=w; if(phase>2*Math.PI) phase-=2*Math.PI; }
-  await playStereo(chL, chR, sr);
-  document.getElementById('status').textContent = 'Done';
+  const status = document.getElementById('status');
+  status.textContent = 'Test tone…';
+  const ac = await getCtx();
+  const osc = ac.createOscillator();
+  const gain = ac.createGain();
+  gain.gain.value = 0.6;
+  osc.frequency.value = 1000;
+  osc.connect(gain); gain.connect(ac.destination);
+  keepAlive(osc);
+  osc.start();
+  setTimeout(() => { try{osc.stop();}catch{} status.textContent='Test done.'; }, 600);
 };
 
 document.getElementById('send').onclick = async () => {
   const enter = document.getElementById('enter').checked ? "\n" : "";
   const txt = document.getElementById('t').value + enter;
-  if(!txt.length){ return; }
-  document.getElementById('status').textContent = 'Sending…';
-
-  // Smaller chunks reduce “all-or-nothing” losses; 240B is a sweet spot.
-  const CHUNK = 240;
+  if(!txt.length) return;
+  document.getElementById('status').textContent='Sending…';
+  const CHUNK=240;
   for(let i=0;i<txt.length;i+=CHUNK){
     await sendText(txt.slice(i,i+CHUNK));
-    // short interframe gap (SBC buffer flush)
-    await new Promise(r=>setTimeout(r, 120));
+    await new Promise(r=>setTimeout(r,120));
   }
-  document.getElementById('status').textContent = 'Sent.';
+  document.getElementById('status').textContent='Sent.';
 };
 </script>
