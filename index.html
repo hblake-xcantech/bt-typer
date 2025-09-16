@@ -1,166 +1,21 @@
 <!doctype html>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Remote Paste → BT</title>
-<style>
-  body{font-family:system-ui;margin:16px;max-width:720px}
-  textarea{width:100%;height:160px}
-  button{margin:6px 6px 6px 0;padding:10px 16px}
-</style>
-<h1>Send to BT-Typer</h1>
-<textarea id="t" placeholder="Paste text here"></textarea><br>
-<label><input id="enter" type="checkbox" checked> Send ENTER at end</label><br>
-<button id="unlock">Unlock Audio</button>
-<button id="test">Test Tone</button>
-<button id="send">Send</button>
+<title>iOS Audio Test</title>
+<button id="unlock">Unlock & Play Tone</button>
 <div id="status"></div>
-
 <script>
-const BAUD=600, MARK=1200, SPACE=2000;
 let actx;
-let _liveNodes = new Set();
-
-// --- AudioContext unlock helpers ---
-async function getCtx() {
-  if (!actx) {
-    actx = new (window.AudioContext || window.webkitAudioContext)();
-  }
-  if (actx.state !== 'running') {
-    try { await actx.resume(); } catch(e) { console.log('resume failed', e); }
-  }
-  return actx;
-}
-function keepAlive(node) {
-  _liveNodes.add(node);
-  const done = () => { _liveNodes.delete(node); };
-  if ('onended' in node) node.onended = done;
-  return node;
-}
-
-// --- CRC16-IBM ---
-function crc16(bytes){
-  let crc=0xFFFF;
-  for(let b of bytes){ crc^=b; for(let i=0;i<8;i++){ const m=crc&1; crc>>=1; if(m) crc^=0xA001; } }
-  return crc&0xFFFF;
-}
-
-// --- Frame builder ---
-function buildFrame(payload){
-  const len = payload.length;
-  const frame = new Uint8Array(2+len+2+1);
-  let o=0;
-  frame[o++]=0x02; // STX
-  frame[o++]=len & 0xFF; frame[o++]=(len>>8)&0xFF;
-  frame.set(payload,o); o+=len;
-  const c = crc16(payload);
-  frame[o++]=c & 0xFF; frame[o++]=(c>>8)&0xFF;
-  frame[o++]=0x03; // ETX
-  return frame;
-}
-
-// --- Bytes → bits (8N2) ---
-function bytesToBits(bytes){
-  const bits=[];
-  for(let b of bytes){
-    bits.push(0); // start
-    for(let i=0;i<8;i++) bits.push((b>>i)&1);
-    bits.push(1); // stop 1
-    bits.push(1); // stop 2
-  }
-  return bits;
-}
-
-// --- BFSK synth continuous phase ---
-function synth(bits, pre_ms, sampleRate){
-  const spb = sampleRate / BAUD;
-  const spb_int = Math.floor(spb);
-  const spb_frac = spb - spb_int;
-  let fracAcc = 0.0, total = 0;
-  for(let _ of bits){ let n = spb_int; fracAcc+=spb_frac; if(fracAcc>=1){ n++; fracAcc-=1; } total += n; }
-  const pre_samps = Math.round(pre_ms/1000*sampleRate);
-  total += pre_samps;
-
-  const chL = new Float32Array(total);
-  const chR = new Float32Array(total);
-
-  let idx=0;
-  let phase=0.0, twoPi=2*Math.PI;
-  let w = twoPi * SPACE / sampleRate;
-  for(let i=0;i<pre_samps;i++){
-    const s = Math.sin(phase)*0.6;
-    chL[idx]=s; chR[idx]=s; idx++; phase+=w; if(phase>twoPi) phase-=twoPi;
-  }
-
-  fracAcc = 0.0;
-  for(let b of bits){
-    const freq = b ? SPACE : MARK;
-    w = twoPi * freq / sampleRate;
-    let n = spb_int; fracAcc+=spb_frac; if(fracAcc>=1){ n++; fracAcc-=1; }
-    for(let i=0;i<n;i++){
-      const s = Math.sin(phase)*0.6;
-      chL[idx]=s; chR[idx]=s; idx++; phase+=w; if(phase>twoPi) phase-=twoPi;
-    }
-  }
-  return [chL,chR];
-}
-
-// --- Play helpers ---
-async function playStereo(chL,chR){
-  const ac = await getCtx();
-  const sr = ac.sampleRate;
-  const buf = ac.createBuffer(2,chL.length,sr);
-  buf.getChannelData(0).set(chL);
-  buf.getChannelData(1).set(chR);
-  const src = ac.createBufferSource();
-  src.buffer = buf;
-  src.connect(ac.destination);
-  keepAlive(src);
-  src.start();
-  await new Promise(r => src.onended = r);
-}
-
-// --- High-level send ---
-async function sendText(txt){
-  const ac = await getCtx();
-  const sr = ac.sampleRate;
-  const enc = new TextEncoder();
-  const payload = enc.encode(txt);
-  const frame = buildFrame(payload);
-  const bits = bytesToBits(frame);
-  const [chL,chR] = synth(bits,250,sr);
-  await playStereo(chL,chR);
-}
-
-// --- UI handlers ---
 document.getElementById('unlock').onclick = async () => {
-  const ac = await getCtx();
-  document.getElementById('status').textContent =
-    `AudioContext: ${ac.state} • ${ac.sampleRate} Hz`;
-};
-
-document.getElementById('test').onclick = async () => {
-  const status = document.getElementById('status');
-  status.textContent = 'Test tone…';
-  const ac = await getCtx();
-  const osc = ac.createOscillator();
-  const gain = ac.createGain();
-  gain.gain.value = 0.6;
-  osc.frequency.value = 1000;
-  osc.connect(gain); gain.connect(ac.destination);
-  keepAlive(osc);
-  osc.start();
-  setTimeout(() => { try{osc.stop();}catch{} status.textContent='Test done.'; }, 600);
-};
-
-document.getElementById('send').onclick = async () => {
-  const enter = document.getElementById('enter').checked ? "\n" : "";
-  const txt = document.getElementById('t').value + enter;
-  if(!txt.length) return;
-  document.getElementById('status').textContent='Sending…';
-  const CHUNK=240;
-  for(let i=0;i<txt.length;i+=CHUNK){
-    await sendText(txt.slice(i,i+CHUNK));
-    await new Promise(r=>setTimeout(r,120));
+  if (!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
+  if (actx.state !== 'running') {
+    try { await actx.resume(); } catch(e){ console.log('resume failed', e); }
   }
-  document.getElementById('status').textContent='Sent.';
+  document.getElementById('status').textContent = 'Context: ' + actx.state;
+  const osc = actx.createOscillator();
+  const gain = actx.createGain();
+  gain.gain.value = 0.5;
+  osc.frequency.value = 1000;
+  osc.connect(gain); gain.connect(actx.destination);
+  osc.start();
+  setTimeout(()=>osc.stop(), 1000);
 };
 </script>
