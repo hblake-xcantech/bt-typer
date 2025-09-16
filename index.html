@@ -1,21 +1,25 @@
 <!doctype html>
-<title>iOS Audio Test</title>
-<button id="unlock">Unlock & Play Tone</button>
+<title>MediaStreamDestination test</title>
+<button id="beep">Beep</button>
+<audio id="out" autoplay></audio>
 <div id="status"></div>
 <script>
 let actx;
-document.getElementById('unlock').onclick = async () => {
-  if (!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
-  if (actx.state !== 'running') {
-    try { await actx.resume(); } catch(e){ console.log('resume failed', e); }
+document.getElementById('beep').onclick = async () => {
+  if (!actx) {
+    actx = new (window.AudioContext||window.webkitAudioContext)();
   }
-  document.getElementById('status').textContent = 'Context: ' + actx.state;
+  if (actx.state !== 'running') await actx.resume();
+  const dest = actx.createMediaStreamDestination();
+  document.getElementById('out').srcObject = dest.stream;
+
   const osc = actx.createOscillator();
+  osc.frequency.value = 1000;
   const gain = actx.createGain();
   gain.gain.value = 0.5;
-  osc.frequency.value = 1000;
-  osc.connect(gain); gain.connect(actx.destination);
+  osc.connect(gain).connect(dest);
   osc.start();
-  setTimeout(()=>osc.stop(), 1000);
+  setTimeout(()=>osc.stop(),1000);
+  document.getElementById('status').textContent = "Played via MediaStreamDestination";
 };
 </script>
