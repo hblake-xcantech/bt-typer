@@ -18,15 +18,13 @@
 
 <script>
 const BAUD=600, MARK=1200, SPACE=2000;
-let actx, dest, audioEl;
+let actx;
+const audioEl = document.getElementById("out");
 
 // --- Init / unlock ---
 async function getCtx() {
   if (!actx) {
     actx = new (window.AudioContext||window.webkitAudioContext)();
-    dest = actx.createMediaStreamDestination();
-    audioEl = document.getElementById("out");
-    audioEl.srcObject = dest.stream;
   }
   if (actx.state !== "running") {
     try { await actx.resume(); } catch(e){ console.log("resume failed", e); }
@@ -99,18 +97,26 @@ function synth(bits, pre_ms, sampleRate){
   return ch;
 }
 
-// --- Play through MediaStreamDestination ---
+// --- Play one buffer via fresh MediaStreamDestination ---
 async function playMono(samples){
   const ac = await getCtx();
   const sr = ac.sampleRate;
+  const dest = ac.createMediaStreamDestination();
+  audioEl.srcObject = dest.stream;
+
   const buf = ac.createBuffer(1, samples.length, sr);
   buf.getChannelData(0).set(samples);
-
   const src = ac.createBufferSource();
   src.buffer = buf;
   src.connect(dest);
   src.start();
-  return new Promise(r => src.onended = r);
+
+  return new Promise(r=>{
+    src.onended=()=>{
+      audioEl.srcObject=null; // detach after playback ends
+      r();
+    };
+  });
 }
 
 // --- High-level send ---
@@ -134,14 +140,20 @@ document.getElementById('unlock').onclick = async () => {
 
 document.getElementById('test').onclick = async () => {
   const ac = await getCtx();
+  const dest = ac.createMediaStreamDestination();
+  audioEl.srcObject = dest.stream;
+
   const osc = ac.createOscillator();
   const gain = ac.createGain();
   gain.gain.value = 0.5;
   osc.frequency.value = 1000;
   osc.connect(gain).connect(dest);
   osc.start();
-  setTimeout(()=>osc.stop(),600);
-  document.getElementById('status').textContent='Test tone played via MediaStreamDestination';
+  setTimeout(()=>{ 
+    osc.stop();
+    audioEl.srcObject=null; // detach after done
+  },600);
+  document.getElementById('status').textContent='Test tone played once';
 };
 
 document.getElementById('send').onclick = async () => {
